@@ -1584,7 +1584,8 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
         case OMX_ExtraDataVideoEncoderSliceInfo:
             {
                 DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataVideoEncoderSliceInfo");
-                OMX_BOOL extra_data = *(OMX_BOOL *)(&paramData);
+                OMX_BOOL extra_data;
+                memcpy(&extra_data, &paramData, sizeof(OMX_BOOL));
 
                 if (venc_set_extradata(OMX_ExtraDataVideoEncoderSliceInfo, extra_data) == false) {
                     DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataVideoEncoderSliceInfo failed");
@@ -1597,7 +1598,8 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
         case OMX_ExtraDataVideoEncoderMBInfo:
             {
                 DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataVideoEncoderMBInfo");
-                OMX_BOOL extra_data = *(OMX_BOOL *)(&paramData);
+                OMX_BOOL extra_data;
+                memcpy(&extra_data, &paramData, sizeof(OMX_BOOL));
 
                 if (venc_set_extradata(OMX_ExtraDataVideoEncoderMBInfo, extra_data) == false) {
                     DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataVideoEncoderMBInfo failed");
