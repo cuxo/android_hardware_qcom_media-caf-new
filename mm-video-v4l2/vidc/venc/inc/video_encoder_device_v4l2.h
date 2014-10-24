@@ -38,7 +38,11 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "omx_video_base.h"
 #include "omx_video_encoder.h"
 #include <linux/videodev2.h>
+#include <linux/fb.h>
 #include <poll.h>
+#include <gui/ISurfaceComposer.h>
+#include <gui/SurfaceComposerClient.h>
+#include <ui/DisplayInfo.h>
 
 #define TIMEOUT 5*60*1000
 
@@ -77,8 +81,15 @@ struct msm_venc_profilelevel {
 
 struct msm_venc_sessionqp {
     unsigned long    iframeqp;
-    unsigned long    pframqp;
-    unsigned long    bframqp;
+    unsigned long    pframeqp;
+    unsigned long    bframeqp;
+};
+
+struct msm_venc_initqp {
+    unsigned long    iframeqp;
+    unsigned long    pframeqp;
+    unsigned long    bframeqp;
+    unsigned long    enableinitqp;
 };
 
 struct msm_venc_qprange {
@@ -304,6 +315,7 @@ class venc_dev
         struct msm_venc_allocatorproperty   m_sInput_buff_property;
         struct msm_venc_allocatorproperty   m_sOutput_buff_property;
         struct msm_venc_sessionqp           session_qp;
+        struct msm_venc_initqp              init_qp;
         struct msm_venc_qprange             session_qp_range;
         struct msm_venc_qprange             session_qp_values;
         struct msm_venc_multiclicecfg       multislice;
@@ -345,6 +357,7 @@ class venc_dev
         bool venc_set_ltrmode(OMX_U32 enable, OMX_U32 count);
         bool venc_set_useltr(OMX_U32 frameIdx);
         bool venc_set_markltr(OMX_U32 frameIdx);
+        bool venc_enable_initial_qp(QOMX_EXTNINDEX_VIDEO_INITIALQP* initqp);
         bool venc_set_inband_video_header(OMX_BOOL enable);
         bool venc_set_au_delimiter(OMX_BOOL enable);
         bool venc_set_vpe_rotation(OMX_S32 rotation_angle);
@@ -353,6 +366,8 @@ class venc_dev
         bool venc_set_perf_level(QOMX_VIDEO_PERF_LEVEL ePerfLevel);
         bool venc_set_vui_timing_info(OMX_BOOL enable);
         bool venc_set_peak_bitrate(OMX_U32 nPeakBitrate);
+        bool venc_set_searchrange();
+
 #ifdef MAX_RES_1080P
         OMX_U32 pmem_free();
         OMX_U32 pmem_allocate(OMX_U32 size, OMX_U32 alignment, OMX_U32 count);
@@ -376,6 +391,9 @@ class venc_dev
         pthread_cond_t pause_resume_cond;
         bool paused;
         int color_format;
+        bool is_searchrange_set;
+        bool enable_mv_narrow_searchrange;
+        DisplayInfo display_info;
 };
 
 enum instance_state {

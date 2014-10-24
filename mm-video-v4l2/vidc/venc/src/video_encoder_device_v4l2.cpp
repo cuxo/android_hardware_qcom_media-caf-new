@@ -208,6 +208,9 @@ venc_dev::venc_dev(class omx_venc *venc_class)
     memset(&voptimecfg, 0, sizeof(voptimecfg));
     memset(&capability, 0, sizeof(capability));
     memset(&hier_p_layers,0,sizeof(hier_p_layers));
+    memset(&display_info,0,sizeof(display_info));
+    is_searchrange_set = false;
+    enable_mv_narrow_searchrange = false;
     memset(&ltrinfo, 0, sizeof(ltrinfo));
     memset(&m_debug,0,sizeof(m_debug));
 
@@ -754,27 +757,34 @@ bool venc_dev::venc_open(OMX_U32 codec)
     unsigned int alignment = 0,buffer_size = 0, temp =0;
     struct v4l2_control control;
     OMX_STRING device_name = (OMX_STRING)"/dev/video/venus_enc";
+    char narrow_searchrange[PROPERTY_VALUE_MAX] = {0};
+    char platform_name[PROPERTY_VALUE_MAX] = {0};
 
-    char platform_name[PROPERTY_VALUE_MAX];
     property_get("ro.board.platform", platform_name, "0");
+    property_get("vidc.enc.narrow.searchrange", narrow_searchrange, "0");
+    if (atoi(narrow_searchrange) && (!strncmp(platform_name, "msm8916", 7))) {
+        enable_mv_narrow_searchrange = true;
+        sp<IBinder> display(SurfaceComposerClient::getBuiltInDisplay(
+                        ISurfaceComposer::eDisplayIdMain));
+        SurfaceComposerClient::getDisplayInfo(display, &display_info);
+        DEBUG_PRINT_LOW("Display panel resolution %dX%d",
+            display_info.w, display_info.h);
+    }
 
     if (!strncmp(platform_name, "msm8610", 7)) {
         device_name = (OMX_STRING)"/dev/video/q6_enc";
     }
-
     m_nDriver_fd = open (device_name, O_RDWR);
-
     if (m_nDriver_fd == 0) {
         DEBUG_PRINT_ERROR("ERROR: Got fd as 0 for msm_vidc_enc, Opening again");
         m_nDriver_fd = open (device_name, O_RDWR);
     }
-
     if ((int)m_nDriver_fd < 0) {
         DEBUG_PRINT_ERROR("ERROR: Omx_venc::Comp Init Returning failure");
         return false;
     }
-
     DEBUG_PRINT_LOW("m_nDriver_fd = %lu", m_nDriver_fd);
+
     // set the basic configuration of the video encoder driver
     m_sVenc_cfg.input_width = OMX_CORE_QCIF_WIDTH;
     m_sVenc_cfg.input_height= OMX_CORE_QCIF_HEIGHT;
@@ -1182,7 +1192,16 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
                     if (!venc_set_color_format(portDefn->format.video.eColorFormat)) {
                         return false;
                     }
-
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE
+                    if ((display_info.w * display_info.h) > (OMX_CORE_720P_WIDTH * OMX_CORE_720P_HEIGHT)
+                        && enable_mv_narrow_searchrange &&
+                        (m_sVenc_cfg.input_width * m_sVenc_cfg.input_height) >=
+                        (OMX_CORE_1080P_WIDTH * OMX_CORE_1080P_HEIGHT)) {
+                        if (venc_set_searchrange() == false) {
+                            DEBUG_PRINT_ERROR("ERROR: Failed to set search range");
+                        }
+                    }
+#endif
                     if (m_sVenc_cfg.input_height != portDefn->format.video.nFrameHeight ||
                             m_sVenc_cfg.input_width != portDefn->format.video.nFrameWidth) {
                         DEBUG_PRINT_LOW("Basic parameter has changed");
@@ -1525,7 +1544,6 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
                 DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoQuantization");
                 OMX_VIDEO_PARAM_QUANTIZATIONTYPE *session_qp =
                     (OMX_VIDEO_PARAM_QUANTIZATIONTYPE *)paramData;
-
                 if (session_qp->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
                     if (venc_set_session_qp (session_qp->nQpI,
                                 session_qp->nQpP,
@@ -1539,6 +1557,22 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
 
                 break;
             }
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP
+        case QOMX_IndexParamVideoInitialQp:
+            {
+                QOMX_EXTNINDEX_VIDEO_INITIALQP * initqp =
+                    (QOMX_EXTNINDEX_VIDEO_INITIALQP *)paramData;
+                 if (initqp->bEnableInitQp) {
+                    DEBUG_PRINT_LOW("Enable initial QP: %d", initqp->bEnableInitQp);
+                    if(venc_enable_initial_qp(initqp) == false) {
+                       DEBUG_PRINT_ERROR("ERROR: Failed to enable initial QP");
+                       return OMX_ErrorUnsupportedSetting;
+                     }
+                 } else
+                    DEBUG_PRINT_ERROR("ERROR: setting QOMX_IndexParamVideoEnableInitialQp");
+                break;
+            }
+#endif
         case OMX_QcomIndexParamVideoQPRange:
             {
                 DEBUG_PRINT_LOW("venc_set_param:OMX_QcomIndexParamVideoQPRange\n");
@@ -1715,6 +1749,18 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
                 }
                 break;
             }
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE
+       case OMX_QcomIndexParamSetMVSearchrange:
+            {
+               DEBUG_PRINT_LOW("venc_set_config: OMX_QcomIndexParamSetMVSearchrange");
+               is_searchrange_set = true;
+               if (!venc_set_searchrange()) {
+                   DEBUG_PRINT_ERROR("ERROR: Failed to set search range");
+                   return false;
+               }
+            }
+            break;
+#endif
         case OMX_IndexParamVideoSliceFMO:
         default:
             DEBUG_PRINT_ERROR("ERROR: Unsupported parameter in venc_set_param: %u",
@@ -2022,6 +2068,10 @@ unsigned venc_dev::venc_start(void)
 {
     enum v4l2_buf_type buf_type;
     int ret,r;
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_REQUEST_SEQ_HEADER
+    struct v4l2_control control = {0};
+#endif
+
     DEBUG_PRINT_HIGH("%s(): Check Profile/Level set in driver before start",
             __func__);
 
@@ -2058,6 +2108,17 @@ unsigned venc_dev::venc_start(void)
         return 1;
 
     streaming[CAPTURE_PORT] = true;
+
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_REQUEST_SEQ_HEADER
+    control.id = V4L2_CID_MPEG_VIDC_VIDEO_REQUEST_SEQ_HEADER;
+    control.value = 1;
+    ret = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+    if (ret) {
+        DEBUG_PRINT_ERROR("failed to request seq header");
+        return 1;
+    }
+#endif
+
     stopped = 0;
     return 0;
 }
@@ -2080,7 +2141,10 @@ void venc_dev::venc_config_print()
             bitrate.target_bitrate, rate_ctrl.rcmode, intra_period.num_pframes);
 
     DEBUG_PRINT_HIGH("ENC_CONFIG: qpI: %ld, qpP: %ld, qpb: %ld",
-            session_qp.iframeqp, session_qp.pframqp,session_qp.bframqp);
+            session_qp.iframeqp, session_qp.pframeqp, session_qp.bframeqp);
+
+    DEBUG_PRINT_HIGH("ENC_CONFIG: Init_qpI: %ld, Init_qpP: %ld, Init_qpb: %ld",
+            init_qp.iframeqp, init_qp.pframeqp, init_qp.bframeqp);
 
     DEBUG_PRINT_HIGH("\nENC_CONFIG: minQP: %d, maxQP: %d",
             session_qp_values.minqp, session_qp_values.maxqp);
@@ -2383,38 +2447,50 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
         // CPU (Eg: MediaCodec)  0            --             0              bufhdr
         // ---------------------------------------------------------------------------------------
         if (metadatamode) {
+            plane.m.userptr = index;
             meta_buf = (encoder_media_buffer_type *)bufhdr->pBuffer;
 
-            if (!meta_buf)
-                return false;
-
-            if (!color_format) {
-                plane.m.userptr = index;
+            if (!meta_buf) {
+                //empty EOS buffer
+                if (!bufhdr->nFilledLen && (bufhdr->nFlags & OMX_BUFFERFLAG_EOS)) {
+                    plane.data_offset = bufhdr->nOffset;
+                    plane.length = bufhdr->nAllocLen;
+                    plane.bytesused = bufhdr->nFilledLen;
+                    DEBUG_PRINT_LOW("venc_empty_buf: empty EOS buffer");
+                } else {
+                    return false;
+                }
+            } else if (!color_format) {
                 if (meta_buf->buffer_type == kMetadataBufferTypeCameraSource) {
-                    plane.data_offset = meta_buf->meta_handle->data[1];
-                    plane.length = meta_buf->meta_handle->data[2];
-                    plane.bytesused = meta_buf->meta_handle->data[2];
-                    DEBUG_PRINT_LOW("venc_empty_buf: camera buf: fd = %d filled %d of %d",
-                            fd, plane.bytesused, plane.length);
+#ifdef V4L2_MSM_BUF_FLAG_YUV_601_709_CLAMP
+                    if (meta_buf->meta_handle->numFds + meta_buf->meta_handle->numInts > 3 &&
+                        meta_buf->meta_handle->data[3] & private_handle_t::PRIV_FLAGS_ITU_R_709)
+                        buf.flags = V4L2_MSM_BUF_FLAG_YUV_601_709_CLAMP;
+#endif
+                    if (meta_buf->meta_handle->numFds + meta_buf->meta_handle->numInts > 2) {
+                        plane.data_offset = meta_buf->meta_handle->data[1];
+                        plane.length = meta_buf->meta_handle->data[2];
+                        plane.bytesused = meta_buf->meta_handle->data[2];
+                    }
+                    DEBUG_PRINT_LOW("venc_empty_buf: camera buf: fd = %d filled %d of %d flag 0x%x",
+                            fd, plane.bytesused, plane.length, buf.flags);
                 } else if (meta_buf->buffer_type == kMetadataBufferTypeGrallocSource) {
                     private_handle_t *handle = (private_handle_t *)meta_buf->meta_handle;
                     fd = handle->fd;
                     plane.data_offset = 0;
                     plane.length = handle->size;
                     plane.bytesused = handle->size;
-                    DEBUG_PRINT_LOW("venc_empty_buf: Opaque camera buf: fd = %d filled %d of %d",
-                            fd, plane.bytesused, plane.length);
+                        DEBUG_PRINT_LOW("venc_empty_buf: Opaque camera buf: fd = %d "
+                                ": filled %d of %d", fd, plane.bytesused, plane.length);
                 }
             } else {
-                plane.m.userptr = (unsigned long) bufhdr->pBuffer;
                 plane.data_offset = bufhdr->nOffset;
                 plane.length = bufhdr->nAllocLen;
                 plane.bytesused = bufhdr->nFilledLen;
-                DEBUG_PRINT_LOW("venc_empty_buf: Opaque non-camera buf: fd = %d filled %d of %d",
-                        fd, plane.bytesused, plane.length);
+                DEBUG_PRINT_LOW("venc_empty_buf: Opaque non-camera buf: fd = %d "
+                        ": filled %d of %d", fd, plane.bytesused, plane.length);
             }
         } else {
-            plane.m.userptr = (unsigned long) bufhdr->pBuffer;
             plane.data_offset = bufhdr->nOffset;
             plane.length = bufhdr->nAllocLen;
             plane.bytesused = bufhdr->nFilledLen;
@@ -2432,7 +2508,7 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
     buf.length = 1;
 
     if (bufhdr->nFlags & OMX_BUFFERFLAG_EOS)
-        buf.flags = V4L2_QCOM_BUF_FLAG_EOS;
+        buf.flags |= V4L2_QCOM_BUF_FLAG_EOS;
 
     buf.timestamp.tv_sec = bufhdr->nTimeStamp / 1000000;
     buf.timestamp.tv_usec = (bufhdr->nTimeStamp % 1000000);
@@ -2646,6 +2722,53 @@ bool venc_dev::venc_set_slice_delivery_mode(OMX_U32 enable)
     return true;
 }
 
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP
+bool venc_dev::venc_enable_initial_qp(QOMX_EXTNINDEX_VIDEO_INITIALQP* initqp)
+{
+    int rc;
+    struct v4l2_control control;
+    struct v4l2_ext_control ctrl[4];
+    struct v4l2_ext_controls controls;
+
+    ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP;
+    ctrl[0].value = initqp->nQpI;
+    ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_P_FRAME_QP;
+    ctrl[1].value = initqp->nQpP;
+    ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_B_FRAME_QP;
+    ctrl[2].value = initqp->nQpB;
+    ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_ENABLE_INITIAL_QP;
+    ctrl[3].value = initqp->bEnableInitQp;
+
+    controls.count = 4;
+    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
+    controls.controls = ctrl;
+
+    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%x val=%d, id=%x val=%d, id=%x val=%d, id=%x val=%d",
+                    controls.controls[0].id, controls.controls[0].value,
+                    controls.controls[1].id, controls.controls[1].value,
+                    controls.controls[2].id, controls.controls[2].value,
+                    controls.controls[3].id, controls.controls[3].value);
+
+    rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed to set session_qp %d", rc);
+        return false;
+    }
+
+    init_qp.iframeqp = initqp->nQpI;
+    init_qp.pframeqp = initqp->nQpP;
+    init_qp.bframeqp = initqp->nQpB;
+    init_qp.enableinitqp = initqp->bEnableInitQp;
+
+    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x val=%d, id=%x val=%d, id=%x val=%d, id=%x val=%d",
+                    controls.controls[0].id, controls.controls[0].value,
+                    controls.controls[1].id, controls.controls[1].value,
+                    controls.controls[2].id, controls.controls[2].value,
+                    controls.controls[3].id, controls.controls[3].value);
+    return true;
+}
+#endif
+
 bool venc_dev::venc_set_session_qp(OMX_U32 i_frame_qp, OMX_U32 p_frame_qp,OMX_U32 b_frame_qp)
 {
     int rc;
@@ -2678,7 +2801,7 @@ bool venc_dev::venc_set_session_qp(OMX_U32 i_frame_qp, OMX_U32 p_frame_qp,OMX_U3
 
     DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
 
-    session_qp.pframqp = control.value;
+    session_qp.pframeqp = control.value;
 
     if ((codec_profile.profile == V4L2_MPEG_VIDEO_H264_PROFILE_MAIN) ||
             (codec_profile.profile == V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)) {
@@ -2696,7 +2819,7 @@ bool venc_dev::venc_set_session_qp(OMX_U32 i_frame_qp, OMX_U32 p_frame_qp,OMX_U3
 
         DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
 
-        session_qp.bframqp = control.value;
+        session_qp.bframeqp = control.value;
     }
 
     return true;
@@ -3089,6 +3212,13 @@ bool venc_dev::venc_set_intra_period(OMX_U32 nPFrames, OMX_U32 nBFrames)
             (codec_profile.profile != V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)) {
         nBFrames=0;
     }
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE
+    if ((display_info.w * display_info.h > OMX_CORE_720P_WIDTH * OMX_CORE_720P_HEIGHT)
+        && enable_mv_narrow_searchrange && (m_sVenc_cfg.input_width * m_sVenc_cfg.input_height >=
+        OMX_CORE_1080P_WIDTH * OMX_CORE_1080P_HEIGHT || is_searchrange_set)) {
+        nBFrames=0;
+    }
+#endif
 
     control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES;
     if (!nBFrames) {
@@ -3759,6 +3889,83 @@ bool venc_dev::venc_set_vpe_rotation(OMX_S32 rotation_angle)
     if (bufreq.count >= m_sOutput_buff_property.mincount)
         m_sOutput_buff_property.actualcount = m_sOutput_buff_property.mincount = bufreq.count;
 
+    return true;
+}
+
+bool venc_dev::venc_set_searchrange()
+{
+#ifdef V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE
+    DEBUG_PRINT_LOW("venc_set_searchrange");
+    struct v4l2_control control;
+    struct v4l2_ext_control ctrl[6];
+    struct v4l2_ext_controls controls;
+    int rc;
+
+    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_MPEG4) {
+        ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE;
+        ctrl[0].value = 16;
+        ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_Y_RANGE;
+        ctrl[1].value = 4;
+        ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_X_RANGE;
+        ctrl[2].value = 16;
+        ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_Y_RANGE;
+        ctrl[3].value = 4;
+        ctrl[4].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_X_RANGE;
+        ctrl[4].value = 12;
+        ctrl[5].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_Y_RANGE;
+        ctrl[5].value = 4;
+    } else if ((m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) ||
+               (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8)) {
+        ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE;
+        ctrl[0].value = 16;
+        ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_Y_RANGE;
+        ctrl[1].value = 4;
+        ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_X_RANGE;
+        ctrl[2].value = 16;
+        ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_Y_RANGE;
+        ctrl[3].value = 4;
+        ctrl[4].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_X_RANGE;
+        ctrl[4].value = 12;
+        ctrl[5].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_Y_RANGE;
+        ctrl[5].value = 4;
+    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H263) {
+        ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE;
+        ctrl[0].value = 4;
+        ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_Y_RANGE;
+        ctrl[1].value = 4;
+        ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_X_RANGE;
+        ctrl[2].value = 4;
+        ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_Y_RANGE;
+        ctrl[3].value = 4;
+        ctrl[4].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_X_RANGE;
+        ctrl[4].value = 4;
+        ctrl[5].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_Y_RANGE;
+        ctrl[5].value = 4;
+    } else {
+        DEBUG_PRINT_ERROR("Invalid codec type");
+        return false;
+    }
+    controls.count = 6;
+    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
+    controls.controls = ctrl;
+
+    DEBUG_PRINT_LOW(" Calling IOCTL set control for"
+        "id=%x, val=%d id=%x, val=%d"
+        "id=%x, val=%d id=%x, val=%d"
+        "id=%x, val=%d id=%x, val=%d",
+        controls.controls[0].id, controls.controls[0].value,
+        controls.controls[1].id, controls.controls[1].value,
+        controls.controls[2].id, controls.controls[2].value,
+        controls.controls[3].id, controls.controls[3].value,
+        controls.controls[4].id, controls.controls[4].value,
+        controls.controls[5].id, controls.controls[5].value);
+
+    rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed to set search range %d", rc);
+        return false;
+    }
+#endif
     return true;
 }
 
